@@ -1,0 +1,1175 @@
+//! The window: header, search, results, and in-window modals.
+//!
+//! Every colour comes from the saved palette. Icons are the monochrome
+//! Lucide SVGs that gpui-kit ships, painted in the text colour, so they take
+//! the theme like everything else.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use gpui_kit::base::ThemeAppearance;
+use gpui_kit::base::input::{InputEvent, InputState};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    Animation, AnimationExt as _, AnyElement, App, AppContext as _, ClickEvent, Context, Div, ElementId, Entity,
+    FocusHandle, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement as _, Styled,
+    WindowBackgroundAppearance, Window, deferred, div, px,
+};
+use gpui_omarchy::{IconName, Theme as OmarchyTheme, icon, input};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+
+use crate::color::Rgba;
+use crate::model::{self, Entry, LANGS, Outcome};
+use crate::theme::{Palette, Store, Theme};
+use crate::urban::{self, UrbanDef};
+
+/// Panels fade and scale from 98% over 120 ms with an ease-out-cubic curve,
+/// and closing runs the same motion backwards.
+const MOTION: Duration = Duration::from_millis(120);
+/// The blur samples the page on a grid of this many pixels, inside a disk of this radius.
+const BLUR_STEP: f32 = 2.2;
+const BLUR_RADIUS: f32 = 7.0;
+const SCRIM_ALPHA: f32 = 0.60;
+
+fn reduced_motion() -> bool {
+    std::env::var("DICTIONARY_REDUCED_MOTION").is_ok_and(|v| v == "1")
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+pub fn hsla(color: Rgba) -> Hsla {
+    gpui_kit::Rgba {
+        r: f32::from(color.r) / 255.0,
+        g: f32::from(color.g) / 255.0,
+        b: f32::from(color.b) / 255.0,
+        a: f32::from(color.a) / 255.0,
+    }
+    .into()
+}
+
+/// The toolkit theme for a palette, so the text field and every default
+/// widget colour follow it too.
+fn toolkit_theme(p: &Palette) -> OmarchyTheme {
+    OmarchyTheme {
+        name: "Dictionary".into(),
+        appearance: if p.is_light() { ThemeAppearance::Light } else { ThemeAppearance::Dark },
+        background: hsla(p.background.opaque()),
+        surface: hsla(p.surface),
+        inset: hsla(p.surface_alt),
+        foreground: hsla(p.text),
+        secondary: hsla(p.muted),
+        bright: hsla(p.text),
+        accent: hsla(p.accent),
+        on_accent: hsla(p.accent_text),
+        selection: hsla(p.selection),
+        border: hsla(p.border),
+        danger: hsla(p.danger),
+        warning: hsla(p.warning),
+        success: hsla(p.success),
+        font: ".SystemUIFont".into(),
+        mono_font: "monospace".into(),
+    }
+}
+
+fn background_appearance(p: &Palette) -> WindowBackgroundAppearance {
+    // Opacity is honoured when the compositor supports it; the RGB channels
+    // are the same either way.
+    if p.background.a < 255 { WindowBackgroundAppearance::Blurred } else { WindowBackgroundAppearance::Opaque }
+}
+
+enum View {
+    Idle,
+    Loading(String),
+    Done(String, Outcome),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Language,
+    Help,
+}
+
+struct Modal {
+    kind: Kind,
+    closing: bool,
+    /// Distinguishes one open or close from the next so each animates once.
+    id: u64,
+}
+
+pub struct Dictionary {
+    theme: Theme,
+    input: Entity<InputState>,
+    lang: &'static str,
+    view: View,
+    seq: u64,
+    modal: Option<Modal>,
+    modal_row: usize,
+    /// Urban Dictionary results for the current word; `None` until asked.
+    urban: Option<Result<Vec<UrbanDef>, String>>,
+    /// Whether the Urban Dictionary section is shown (Ctrl U).
+    urban_on: bool,
+    focus: FocusHandle,
+    _watcher: Option<RecommendedWatcher>,
+}
+
+impl Dictionary {
+    pub fn new(
+        store: Store,
+        word: Option<String>,
+        lang: Option<String>,
+        panel: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut theme = store.load().unwrap_or_default();
+        if store.refresh(&mut theme).unwrap_or(false) {
+            let _ = store.save(&theme);
+        }
+        apply_theme(&theme.palette, window, cx);
+
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search for a word"));
+        cx.subscribe_in(&input, window, |this, _, event, _window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit(cx);
+            }
+        })
+        .detach();
+
+        let dirty = Arc::new(AtomicBool::new(false));
+        let watcher = watch(&store, &dirty);
+        let watched = store.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut tick = 0_u32;
+            loop {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                tick = tick.wrapping_add(1);
+                // The file watcher flags edits at once; the poll is the
+                // safety net, and the only way to notice a followed
+                // palette that changes while the settings file does not.
+                if !dirty.swap(false, Ordering::SeqCst) && tick % 4 != 0 {
+                    continue;
+                }
+                let store = watched.clone();
+                let next = cx.background_executor().spawn(async move { sync(&store) }).await;
+                let Some(next) = next else { continue };
+                let alive = this
+                    .update_in(cx, |this, window, cx| {
+                        if this.theme != next {
+                            apply_theme(&next.palette, window, cx);
+                            this.theme = next;
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let lang = lang
+            .as_deref()
+            .and_then(|code| LANGS.iter().find(|l| l.0 == code))
+            .map_or("en", |l| l.0);
+        let mut this = Self {
+            theme,
+            input,
+            lang,
+            view: View::Idle,
+            seq: 0,
+            modal: None,
+            modal_row: 0,
+            urban: None,
+            urban_on: true,
+            focus: cx.focus_handle(),
+            _watcher: watcher,
+        };
+        if let Some(word) = word {
+            this.input.update(cx, |state, cx| state.set_value(word.clone(), window, cx));
+            this.search(word, cx);
+        }
+        match panel.as_deref() {
+            Some("help") => this.open(Kind::Help, window, cx),
+            Some("language") => this.open(Kind::Language, window, cx),
+            _ => {}
+        }
+        this
+    }
+
+    pub fn focus_input(&self, window: &mut Window, cx: &mut App) {
+        let input = self.input.clone();
+        input.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    fn palette(&self) -> Palette {
+        self.theme.palette.shown()
+    }
+
+    fn submit(&mut self, cx: &mut Context<Self>) {
+        let word = self.input.read(cx).value().trim().to_owned();
+        if word.is_empty() {
+            self.view = View::Idle;
+            cx.notify();
+        } else {
+            self.search(word, cx);
+        }
+    }
+
+    fn search(&mut self, word: String, cx: &mut Context<Self>) {
+        self.seq += 1;
+        let seq = self.seq;
+        let lang = self.lang;
+        self.view = View::Loading(word.clone());
+        self.urban = None;
+        cx.notify();
+        if self.urban_on && lang == "en" {
+            // Its own task, so a slow answer never holds up the dictionary.
+            let query = word.clone();
+            cx.spawn(async move |this, cx| {
+                let found = cx.background_executor().spawn(async move { urban::urban(&query) }).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.seq == seq {
+                        this.urban = Some(found);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.spawn(async move |this, cx| {
+            let query = word.clone();
+            let outcome = cx.background_executor().spawn(async move { model::lookup(&query, lang) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.seq == seq {
+                    this.view = View::Done(word, outcome);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn pick(&mut self, word: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |state, cx| state.set_value(word.to_owned(), window, cx));
+        self.search(word.to_owned(), cx);
+    }
+
+    fn open(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.modal.as_ref().map_or(0, |m| m.id) + 1;
+        self.modal_row = LANGS.iter().position(|l| l.0 == self.lang).unwrap_or(0);
+        self.modal = Some(Modal { kind, closing: false, id });
+        // Keys go to the window while a panel is up, not the text field.
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(modal) = self.modal.as_mut() else { return };
+        if modal.closing {
+            return;
+        }
+        modal.closing = true;
+        modal.id += 1;
+        let id = modal.id;
+        self.focus_input(window, cx);
+        cx.notify();
+        let wait = if reduced_motion() { Duration::ZERO } else { MOTION };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.modal.as_ref().is_some_and(|m| m.id == id && m.closing) {
+                    this.modal = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn choose_language(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.lang = LANGS[row].0;
+        self.close(window, cx);
+        let word = self.input.read(cx).value().trim().to_owned();
+        if !word.is_empty() {
+            self.search(word, cx);
+        }
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let ctrl = event.keystroke.modifiers.control;
+        if self.modal.as_ref().is_some_and(|m| !m.closing) {
+            let kind = self.modal.as_ref().map(|m| m.kind);
+            match key {
+                "escape" => self.close(window, cx),
+                "f1" => self.close(window, cx),
+                "down" if kind == Some(Kind::Language) => {
+                    self.modal_row = (self.modal_row + 1) % LANGS.len();
+                    cx.notify();
+                }
+                "up" if kind == Some(Kind::Language) => {
+                    self.modal_row = (self.modal_row + LANGS.len() - 1) % LANGS.len();
+                    cx.notify();
+                }
+                "enter" if kind == Some(Kind::Language) => self.choose_language(self.modal_row, window, cx),
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            "escape" => {
+                if self.input.read(cx).value().is_empty() {
+                    self.view = View::Idle;
+                } else {
+                    self.input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                cx.notify();
+            }
+            "l" if ctrl => self.open(Kind::Language, window, cx),
+            "u" if ctrl => {
+                self.urban_on = !self.urban_on;
+                let shown = match &self.view {
+                    View::Done(word, _) => Some(word.clone()),
+                    _ => None,
+                };
+                if let Some(word) = shown.filter(|_| self.urban_on && self.lang == "en" && self.urban.is_none()) {
+                    self.search(word, cx);
+                }
+                cx.notify();
+            }
+            "f1" => self.open(Kind::Help, window, cx),
+            _ => {}
+        }
+    }
+}
+
+/// Load the saved theme, follow its source, and persist what changed.
+fn sync(store: &Store) -> Option<Theme> {
+    let mut theme = store.load().ok()?;
+    if store.refresh(&mut theme).unwrap_or(false) {
+        let _ = store.save(&theme);
+    }
+    Some(theme)
+}
+
+/// Watch the settings *directory*: an atomic rename replaces the file's
+/// inode, which a watch on the file itself would lose.
+fn watch(store: &Store, dirty: &Arc<AtomicBool>) -> Option<RecommendedWatcher> {
+    std::fs::create_dir_all(store.dir()).ok()?;
+    let flag = dirty.clone();
+    let mut watcher = notify::recommended_watcher(move |_| flag.store(true, Ordering::SeqCst)).ok()?;
+    watcher.watch(store.dir(), RecursiveMode::NonRecursive).ok()?;
+    Some(watcher)
+}
+
+fn apply_theme(palette: &Palette, window: &mut Window, cx: &mut App) {
+    toolkit_theme(&palette.shown()).apply(cx);
+    window.set_background_appearance(background_appearance(palette));
+}
+
+// ---------------------------------------------------------------- drawing
+
+fn pill(id: impl Into<ElementId>, p: &Palette, accent: bool) -> Stateful<Div> {
+    let (bg, fg, hover) = if accent {
+        (hsla(p.accent), hsla(p.accent_text), hsla(p.accent).opacity(0.85))
+    } else {
+        (hsla(p.surface), hsla(p.text), hsla(p.surface_alt))
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .h(px(40.))
+        .px(px(14.))
+        .rounded(px(12.))
+        .bg(bg)
+        .text_color(fg)
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+}
+
+fn ic(name: IconName, size: f32) -> impl IntoElement {
+    icon(name).size(px(size))
+}
+
+impl Dictionary {
+    fn header(&self, cx: &mut Context<Self>) -> Div {
+        let p = self.palette();
+        let lang = model::lang_name(self.lang);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(
+                div()
+                    .size(px(40.))
+                    .rounded(px(12.))
+                    .bg(hsla(p.accent))
+                    .text_color(hsla(p.accent_text))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(ic(IconName::BookOpen, 22.)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Dictionary"))
+                    .child(div().text_size(px(12.)).text_color(hsla(p.muted)).child(self.caption())),
+            )
+            .child(
+                pill("lang", &p, false)
+                    .child(ic(IconName::Globe, 16.))
+                    .child(div().text_size(px(13.)).child(lang))
+                    .child(ic(IconName::ChevronDown, 14.))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open(Kind::Language, window, cx))),
+            )
+            .child(
+                pill("help", &p, false)
+                    .px(px(11.))
+                    .child(ic(IconName::Info, 16.))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.open(Kind::Help, window, cx))),
+            )
+    }
+
+    fn caption(&self) -> String {
+        match &self.view {
+            View::Idle => "Look up a word".into(),
+            View::Loading(_) => "Looking up…".into(),
+            View::Done(_, Outcome::Found(entry)) => {
+                let mut kinds: Vec<&str> = Vec::new();
+                for group in &entry.groups {
+                    if !group.pos.is_empty() && !kinds.contains(&group.pos.as_str()) {
+                        kinds.push(&group.pos);
+                    }
+                }
+                kinds.truncate(4);
+                kinds.join(" · ")
+            }
+            View::Done(_, Outcome::Missing { .. }) => "No definition".into(),
+            View::Done(_, Outcome::Offline { .. }) => "Could not reach Wiktionary".into(),
+        }
+    }
+
+    /// The live text field and search button.
+    fn search_row(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let p = self.palette();
+        let field = input("query", &self.input, window, cx)
+            .rounded(px(12.))
+            .h(px(44.))
+            .text_size(px(15.))
+            .prefix(ic(IconName::Search, 16.))
+            .into_any_element();
+        div()
+            .flex()
+            .gap(px(10.))
+            .child(div().flex_1().min_w_0().child(field))
+            .child(
+                pill("go", &p, true)
+                    .h(px(44.))
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Search"))
+                    .child(ic(IconName::ArrowRight, 16.))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.submit(cx))),
+            )
+    }
+
+    /// The same row drawn without behaviour, for the blurred copies.
+    fn search_row_still(&self, cx: &App) -> Div {
+        let p = self.palette();
+        let text = self.input.read(cx).value();
+        let shown = if text.is_empty() { "Search for a word".into() } else { text };
+        let muted = hsla(p.muted);
+        div()
+            .flex()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(44.))
+                    .px(px(12.))
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(hsla(p.border))
+                    .bg(hsla(p.surface))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(15.))
+                    .child(div().text_color(muted).child(ic(IconName::Search, 16.)))
+                    .child(div().child(shown)),
+            )
+            .child(
+                pill("go-still", &p, true)
+                    .h(px(44.))
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Search"))
+                    .child(ic(IconName::ArrowRight, 16.)),
+            )
+    }
+
+    fn body(&self, scroll: bool, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette();
+        let content: AnyElement = match &self.view {
+            View::Idle => centered(
+                &p,
+                IconName::BookOpen,
+                "Type a word and press Enter",
+                "Webster's 1913 works offline; other editions use Wiktionary. English also shows Urban Dictionary.",
+            ),
+            View::Loading(word) => centered(&p, IconName::Loader, &format!("Looking up “{word}”…"), ""),
+            View::Done(_, Outcome::Found(entry)) => entry_view(&p, entry),
+            View::Done(word, Outcome::Missing { suggestions }) => {
+                self.miss(&p, word, suggestions, "No results", cx)
+            }
+            View::Done(word, Outcome::Offline { suggestions }) => {
+                self.miss(&p, word, suggestions, "Could not reach Wiktionary. Check your connection.", cx)
+            }
+        };
+        let shown = if let View::Done(word, _) = &self.view { word.as_str() } else { "" };
+        let content = if matches!(self.view, View::Done(..)) && self.urban_on && self.lang == "en" {
+            let primary_found = matches!(self.view, View::Done(_, Outcome::Found(_)));
+            let urban_found = self.urban.as_ref().is_some_and(|result| {
+                result.as_ref().is_ok_and(|defs| !defs.is_empty())
+            });
+            if primary_found || urban_found {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(22.))
+                    .when(primary_found, |column| column.child(result_panel(&p).child(content)))
+                    .when(urban_found, |column| {
+                        column.child(result_panel(&p).child(urban_view(&p, shown, self.urban.as_ref(), scroll)))
+                    })
+                    .into_any_element()
+            } else if self.urban.is_none() {
+                result_panel(&p)
+                    .child(urban_view(&p, shown, None, scroll))
+                    .into_any_element()
+            } else {
+                result_panel(&p)
+                    .child(centered(&p, IconName::Search, "No results", ""))
+                    .into_any_element()
+            }
+        } else {
+            result_panel(&p)
+                .when(matches!(self.view, View::Idle), |panel| panel.h_full())
+                .child(content)
+                .into_any_element()
+        };
+        let card = div()
+            .flex_1()
+            .min_h_0()
+            .child(if scroll {
+                div().id("results").size_full().overflow_y_scroll().child(content).into_any_element()
+            } else {
+                div().size_full().child(content).into_any_element()
+            });
+        card.into_any_element()
+    }
+
+    fn miss(&self, p: &Palette, word: &str, suggestions: &[String], message: &str, cx: &mut Context<Self>) -> AnyElement {
+        let mut column = div().flex().flex_col().gap(px(14.)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .text_color(hsla(p.warning))
+                .child(ic(IconName::Info, 18.))
+                .child(div().text_size(px(15.)).child(format!("“{word}”: {message}"))),
+        );
+        if !suggestions.is_empty() {
+            let mut chips = div().flex().flex_wrap().items_center().gap(px(8.)).child(
+                div().text_size(px(13.)).text_color(hsla(p.muted)).child("Did you mean"),
+            );
+            for (index, suggestion) in suggestions.iter().enumerate() {
+                let value = suggestion.clone();
+                chips = chips.child(
+                    pill(("chip", index), p, false)
+                        .h(px(32.))
+                        .px(px(12.))
+                        .child(div().text_size(px(13.)).child(suggestion.clone()))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.pick(&value, window, cx))),
+                );
+            }
+            column = column.child(chips);
+        }
+        column.into_any_element()
+    }
+
+    /// The whole page. `live` pages carry the real text field and scroll.
+    fn page(&self, live: bool, window: &Window, cx: &mut Context<Self>) -> Div {
+        let p = self.palette();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .p(px(22.))
+            .text_color(hsla(p.text))
+            .child(self.header(cx))
+            .child(if live { self.search_row(window, cx) } else { self.search_row_still(cx) })
+            .child(self.body(live, cx))
+    }
+
+    fn modal_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let modal = self.modal.as_ref()?;
+        let p = self.palette();
+        let (kind, closing, id) = (modal.kind, modal.closing, modal.id);
+        let duration = if reduced_motion() { Duration::from_millis(1) } else { MOTION };
+
+        // A frozen, blurred copy of the page. Each copy is opaque and layer k
+        // has weight 1/(k+1), so the stack is a running mean of the samples
+        // (a disk of offsets on a grid about a stroke wide). The first copy
+        // is unshifted and covers the live page.
+        let bg = hsla(p.background.opaque());
+        let mut still = |dx: f32, dy: f32, weight: f32, n: usize| {
+            div().id(("still", n)).absolute().top(px(dy)).left(px(dx)).size_full().bg(bg).opacity(weight)
+                .child(self.page(false, window, cx))
+        };
+        let mut offsets: Vec<(f32, f32)> = Vec::new();
+        for j in -3_i32..=3 {
+            for i in -3_i32..=3 {
+                let (x, y) = (i as f32 * BLUR_STEP, j as f32 * BLUR_STEP);
+                if (x, y) != (0.0, 0.0) && x.hypot(y) <= BLUR_RADIUS { offsets.push((x, y)); }
+            }
+        }
+        let mut blur = div().absolute().inset_0().overflow_hidden().child(still(0.0, 0.0, 1.0, 0));
+        for (k, (x, y)) in offsets.into_iter().enumerate() {
+            blur = blur.child(still(x, y, 1.0 / (k as f32 + 2.0), k + 1));
+        }
+        let scrim = hsla(p.background.opaque()).opacity(SCRIM_ALPHA);
+        let card = self.card(kind, &p, cx);
+
+        let progress = move |t: f32| {
+            let eased = ease_out_cubic(t);
+            if closing { 1.0 - eased } else { eased }
+        };
+        let layer = div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .child(blur.with_animation(
+                ElementId::from(("blur", id)),
+                Animation::new(duration),
+                move |el, t| el.opacity(progress(t)),
+            ))
+            .child(div().absolute().inset_0().bg(scrim).with_animation(
+                ElementId::from(("scrim", id)),
+                Animation::new(duration),
+                move |el, t| el.opacity(progress(t)),
+            ))
+            .child(
+                div().absolute().inset_0().flex().items_center().justify_center().child(
+                    card.with_animation(
+                        ElementId::from(("card", id)),
+                        Animation::new(duration),
+                        move |el, t| {
+                            let v = progress(t);
+                            el.opacity(v).w(px(480.0 * (0.98 + 0.02 * v))).mt(px((1.0 - v) * 6.0))
+                        },
+                    ),
+                ),
+            );
+        Some(deferred(layer).with_priority(10).into_any_element())
+    }
+
+    fn card(&self, kind: Kind, p: &Palette, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (title, subtitle) = match kind {
+            Kind::Language => ("Language", "Choose a Wiktionary edition. English also searches Webster's 1913 offline."),
+            Kind::Help => ("Dictionary", "A portable dictionary with themeable colors."),
+        };
+        let mut card = div()
+            .id("modal-card")
+            .occlude()
+            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .max_h(px(560.))
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .p(px(24.))
+            .rounded(px(18.))
+            .bg(hsla(p.surface))
+            .border_1()
+            .border_color(hsla(p.border))
+            .text_color(hsla(p.text))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(title))
+                            .child(div().text_size(px(13.)).text_color(hsla(p.muted)).child(subtitle)),
+                    )
+                    .child(
+                        pill("modal-close", p, false)
+                            .size(px(34.))
+                            .px(px(0.))
+                            .justify_center()
+                            .child(ic(IconName::Close, 16.))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.close(window, cx))),
+                    ),
+            );
+        match kind {
+            Kind::Language => {
+                let mut list = div().id("lang-list").flex().flex_col().gap(px(2.)).overflow_y_scroll().max_h(px(380.));
+                for (row, (code, name, _)) in LANGS.iter().enumerate() {
+                    let current = *code == self.lang;
+                    let highlighted = row == self.modal_row;
+                    list = list.child(
+                        div()
+                            .id(("lang-row", row))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .h(px(38.))
+                            .px(px(12.))
+                            .rounded(px(10.))
+                            .cursor_pointer()
+                            .when(highlighted, |d| d.bg(hsla(p.selection)))
+                            .hover({
+                                let hover = hsla(p.surface_alt);
+                                move |s| s.bg(hover)
+                            })
+                            .child(div().flex_1().text_size(px(14.)).child(*name))
+                            .child(div().text_size(px(12.)).text_color(hsla(p.muted)).child(code.to_uppercase()))
+                            .child(div().w(px(16.)).text_color(hsla(p.accent)).when(current, |d| d.child(ic(IconName::Check, 16.))))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.choose_language(row, window, cx))),
+                    );
+                }
+                card = card.child(list);
+            }
+            Kind::Help => {
+                let rows = [
+                    ("Enter", "Look up the word"),
+                    ("Esc", "Clear the field, or close a panel"),
+                    ("Ctrl L", "Choose a language"),
+                    ("Ctrl U", "Show or hide Urban Dictionary"),
+                    ("F1", "Show this panel"),
+                ];
+                let mut list = div().flex().flex_col().gap(px(8.));
+                for (keys, what) in rows {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .w(px(72.))
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .rounded(px(8.))
+                                    .bg(hsla(p.surface_alt))
+                                    .border_1()
+                                    .border_color(hsla(p.border))
+                                    .text_size(px(12.))
+                                    .flex()
+                                    .justify_center()
+                                    .child(keys),
+                            )
+                            .child(div().text_size(px(14.)).child(what)),
+                    );
+                }
+                card = card.child(list).child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(hsla(p.muted))
+                        .child("English definitions come from Webster's 1913 (public domain text, GCIDE data under the GPL). Other editions use Wiktionary. English lookups also show Urban Dictionary, whose entries can be explicit."),
+                );
+            }
+        }
+        card
+    }
+}
+
+fn centered(p: &Palette, name: IconName, title: &str, hint: &str) -> AnyElement {
+    div()
+        .size_full()
+        .min_h(px(180.))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(10.))
+        .text_color(hsla(p.muted))
+        .child(ic(name, 40.))
+        .child(div().text_size(px(16.)).text_color(hsla(p.text)).child(title.to_owned()))
+        .when(!hint.is_empty(), |d| d.child(div().text_size(px(13.)).child(hint.to_owned())))
+        .into_any_element()
+}
+
+fn result_panel(p: &Palette) -> Div {
+    div()
+        .w_full()
+        .p(px(22.))
+        .rounded(px(16.))
+        .bg(hsla(p.surface))
+        .border_1()
+        .border_color(hsla(p.border))
+        .overflow_hidden()
+}
+
+/// The Urban Dictionary section under the entry. Still copies (`full` false)
+/// draw a single definition, since the blur paints the page dozens of times.
+fn urban_view(p: &Palette, word: &str, found: Option<&Result<Vec<UrbanDef>, String>>, full: bool) -> AnyElement {
+    let mut example_color = hsla(p.muted);
+    example_color.l = (example_color.l + 0.05).min(1.);
+    let mut attribution_color = hsla(p.muted);
+    attribution_color.l = (attribution_color.l - 0.05).max(0.);
+    let title = match found {
+        Some(Ok(defs)) if !defs.is_empty() => defs[0].word.to_lowercase(),
+        _ => word.to_lowercase(),
+    };
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(12.))
+                .child(div().text_size(px(30.)).font_weight(FontWeight::BOLD).child(title))
+                .child(badge(p, "Urban Dictionary")),
+        );
+    let note = |text: &str| div().text_size(px(13.)).text_color(hsla(p.muted)).child(text.to_owned());
+    match found {
+        None => column = column.child(note("Looking up…")),
+        Some(Err(_)) => column = column.child(note("Could not reach Urban Dictionary.")),
+        Some(Ok(defs)) if defs.is_empty() => column = column.child(note("No entry on Urban Dictionary.")),
+        Some(Ok(defs)) => {
+            for (index, def) in defs.iter().take(if full { defs.len() } else { 1 }).enumerate() {
+                column = column.child(
+                    div()
+                        .flex()
+                        .gap(px(12.))
+                        .child(div().w(px(22.)).flex_shrink_0().text_size(px(13.)).text_color(hsla(p.muted)).child(format!("{}.", index + 1)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(div().text_size(px(15.)).line_height(px(22.)).child(def.text.clone()))
+                                .when_some(def.example.clone(), |d, example| {
+                                    d.child(
+                                        div()
+                                            .pl(px(10.))
+                                            .border_l_2()
+                                            .border_color(hsla(p.accent))
+                                            .text_size(px(13.))
+                                            .italic()
+                                            .text_color(example_color)
+                                            .child(example),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(attribution_color)
+                                        .child(format!("by {} · {}", def.author, def.date)),
+                                ),
+                        ),
+                );
+            }
+        }
+    }
+    column.into_any_element()
+}
+
+fn badge(p: &Palette, text: &str) -> Div {
+    div()
+        .relative()
+        .child(
+            badge_face(gpui_kit::hsla(0., 0., 0., 0.35), text)
+                .absolute()
+                .top(px(3.))
+                .left(px(0.)),
+        )
+        .child(badge_face(hsla(p.accent), text).relative())
+}
+
+fn badge_face(color: Hsla, text: &str) -> Div {
+    div()
+        .px(px(10.))
+        .py(px(2.))
+        .rounded(px(999.))
+        .border_1()
+        .border_color(color)
+        .text_size(px(11.))
+        .text_color(color)
+        .child(SharedString::from(text.to_owned()))
+}
+
+fn entry_view(p: &Palette, entry: &Entry) -> AnyElement {
+    let mut column = div().flex().flex_col().gap(px(18.)).child(
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(12.))
+            .child(div().text_size(px(30.)).font_weight(FontWeight::BOLD).child(entry.word.clone()))
+            .when(!entry.phonetic.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(15.))
+                        .italic()
+                        .text_color(hsla(p.muted))
+                        .child(entry.phonetic.clone()),
+                )
+            })
+            .child(badge(p, entry.source)),
+    );
+    for group in &entry.groups {
+        let mut section = div().flex().flex_col().gap(px(10.));
+        if !group.pos.is_empty() {
+            section = section.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hsla(p.accent))
+                            .child(group.pos.to_uppercase()),
+                    )
+                    .child(div().flex_1().h(px(1.)).bg(hsla(p.border))),
+            );
+        }
+        for (index, def) in group.defs.iter().enumerate() {
+            section = section.child(
+                div()
+                    .flex()
+                    .gap(px(12.))
+                    .child(div().w(px(22.)).flex_shrink_0().text_size(px(13.)).text_color(hsla(p.muted)).child(format!("{}.", index + 1)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(div().text_size(px(15.)).line_height(px(22.)).child(def.text.clone()))
+                            .when_some(def.example.clone(), |d, example| {
+                                d.child(
+                                    div()
+                                        .pl(px(10.))
+                                        .border_l_2()
+                                        .border_color(hsla(p.accent))
+                                        .text_size(px(13.))
+                                        .italic()
+                                        .text_color(hsla(p.muted))
+                                        .child(example),
+                                )
+                            }),
+                    ),
+            );
+        }
+        column = column.child(section);
+    }
+    column.into_any_element()
+}
+
+impl Render for Dictionary {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.palette();
+        let modal = self.modal_layer(window, cx);
+        div()
+            .id("root")
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(hsla(p.background))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.key(event, window, cx)))
+            .child(self.page(true, window, cx))
+            .children(modal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{Point, TestAppContext, VisualTestContext};
+
+    #[test]
+    fn alpha_survives_the_conversion() {
+        let c = hsla(Rgba { r: 0x0e, g: 0x1e, b: 0x36, a: 0xe0 });
+        assert!((c.a - 224.0 / 255.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn easing_runs_from_zero_to_one() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert!(ease_out_cubic(0.5) > 0.5);
+    }
+
+    fn open(cx: &mut TestAppContext) -> (Entity<Dictionary>, &mut VisualTestContext, tempfile::TempDir) {
+        cx.update(gpui_omarchy::init);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("cfg"));
+        let (view, cx) = cx.add_window_view(move |window, cx| Dictionary::new(store, None, None, None, window, cx));
+        cx.update(|window, cx| window.focus(&view.read(cx).focus.clone(), cx));
+        draw(cx);
+        (view, cx, dir)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    fn press(cx: &mut VisualTestContext, keys: &str) {
+        cx.simulate_keystrokes(keys);
+        cx.run_until_parked();
+        draw(cx);
+    }
+
+    fn modal_kind(view: &Entity<Dictionary>, cx: &mut VisualTestContext) -> Option<(bool, bool)> {
+        view.read_with(cx, |d, _| d.modal.as_ref().map(|m| (m.kind == Kind::Language, m.closing)))
+    }
+
+    #[gpui_kit::test]
+    fn enter_looks_a_word_up_and_escape_clears_it(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        cx.update(|window, cx| {
+            let input = view.read(cx).input.clone();
+            input.update(cx, |state, cx| {
+                state.set_value("xanthic", window, cx);
+                state.focus(window, cx);
+            });
+        });
+        press(cx, "enter");
+        view.read_with(cx, |d, _| match &d.view {
+            View::Done(word, Outcome::Found(entry)) => {
+                assert_eq!(word, "xanthic");
+                assert_eq!(entry.source, "Webster's 1913");
+            }
+            _ => panic!("expected a definition"),
+        });
+        press(cx, "escape");
+        assert!(view.read_with(cx, |d, cx| d.input.read(cx).value().is_empty()));
+        press(cx, "escape");
+        assert!(view.read_with(cx, |d, _| matches!(d.view, View::Idle)));
+    }
+
+    #[gpui_kit::test]
+    fn the_language_panel_opens_chooses_with_the_keyboard_and_closes(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        press(cx, "ctrl-l");
+        assert_eq!(modal_kind(&view, cx), Some((true, false)));
+        // English is highlighted; one down is French.
+        press(cx, "down");
+        press(cx, "enter");
+        assert_eq!(modal_kind(&view, cx), Some((true, true)), "closing animates first");
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(modal_kind(&view, cx), None);
+        assert_eq!(view.read_with(cx, |d, _| d.lang), "fr");
+    }
+
+    #[gpui_kit::test]
+    fn help_opens_with_f1_and_escape_closes_it(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        press(cx, "f1");
+        assert_eq!(modal_kind(&view, cx), Some((false, false)));
+        press(cx, "escape");
+        assert_eq!(modal_kind(&view, cx), Some((false, true)));
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(modal_kind(&view, cx), None);
+    }
+
+    #[gpui_kit::test]
+    fn a_click_outside_the_card_dismisses_the_panel(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        press(cx, "f1");
+        cx.simulate_click(Point::new(px(4.), px(4.)), gpui_kit::Modifiers::none());
+        draw(cx);
+        assert_eq!(modal_kind(&view, cx), Some((false, true)));
+    }
+
+    #[gpui_kit::test]
+    fn every_screen_paints(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        let entry = model::webster("xanthic").unwrap();
+        let screens = [
+            View::Idle,
+            View::Loading("word".into()),
+            View::Done("xanthic".into(), Outcome::Found(entry)),
+            View::Done("recieve".into(), Outcome::Missing { suggestions: vec!["receive".into()] }),
+            View::Done("zzz".into(), Outcome::Offline { suggestions: vec![] }),
+        ];
+        let def = UrbanDef { word: "x".into(), text: "t".into(), example: Some("e".into()), author: "a".into(), date: "2022-03-31".into() };
+        let urbans = [None, Some(Ok(vec![def.clone(), def])), Some(Ok(vec![])), Some(Err("down".to_owned()))];
+        for screen in screens {
+            view.update(cx, |d, cx| {
+                d.view = screen;
+                cx.notify();
+            });
+            for urban in &urbans {
+                view.update(cx, |d, cx| {
+                    d.urban = urban.clone();
+                    cx.notify();
+                });
+                draw(cx);
+                press(cx, "ctrl-l");
+                press(cx, "escape");
+                cx.executor().advance_clock(Duration::from_millis(200));
+                cx.run_until_parked();
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_u_toggles_urban_even_with_the_field_focused(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        cx.update(|window, cx| {
+            let input = view.read(cx).input.clone();
+            input.update(cx, |state, cx| {
+                state.set_value("rizz", window, cx);
+                state.focus(window, cx);
+            });
+        });
+        press(cx, "ctrl-u");
+        assert!(!view.read_with(cx, |d, _| d.urban_on));
+        assert_eq!(view.read_with(cx, |d, cx| d.input.read(cx).value().to_string()), "rizz");
+        press(cx, "ctrl-u");
+        assert!(view.read_with(cx, |d, _| d.urban_on));
+    }
+
+    #[gpui_kit::test]
+    fn a_saved_theme_change_is_applied_live(cx: &mut TestAppContext) {
+        let (view, cx, dir) = open(cx);
+        let store = Store::new(dir.path().join("cfg"));
+        let mut theme = Theme::default();
+        theme.palette.background = Rgba::parse("#e00e1e36").unwrap();
+        store.save(&theme).unwrap();
+        for _ in 0..8 {
+            cx.executor().advance_clock(Duration::from_millis(300));
+            cx.run_until_parked();
+        }
+        assert_eq!(view.read_with(cx, |d, _| d.theme.palette.background.to_saved()), "#e00e1e36");
+    }
+}

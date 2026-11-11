@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Dictionary
+GenericName=Dictionary
+Comment=Look up words in Webster's 1913 offline or Wiktionary in 23 languages
+Exec="@EXEC@" --config-dir "@CONFIG@"
+Icon=io.github.dictionary
+Terminal=false
+Categories=Office;Dictionary;
+Keywords=dictionary;definition;word;lookup;thesaurus;wiktionary;
+StartupWMClass=io.github.dictionary
+StartupNotify=true
