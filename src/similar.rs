@@ -142,6 +142,40 @@ fn select_words(
     words
 }
 
+fn retain_ranked(
+    ranked: &mut Vec<(f32, String)>,
+    word: String,
+    score: f32,
+    pool_size: usize,
+) {
+    if pool_size == 0 {
+        return;
+    }
+    if ranked.iter().any(|(_, existing)| existing == &word) {
+        return;
+    }
+    if ranked.len() < pool_size {
+        ranked.push((score, word));
+        return;
+    }
+    let weakest = ranked
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1))
+        })
+        .map(|(index, _)| index)
+        .expect("non-empty bounded pool");
+    let (weak_score, weak_word) = &ranked[weakest];
+    if score
+        .total_cmp(weak_score)
+        .then_with(|| weak_word.cmp(&word))
+        .is_gt()
+    {
+        ranked[weakest] = (score, word);
+    }
+}
+
 pub fn find(
     profile: &Profile,
     limit: usize,
@@ -159,17 +193,14 @@ pub fn find(
         let score = profile.score(&entry);
         if score > 0. {
             let word = entry.word.to_lowercase();
-            if !ranked.iter().any(|(_, existing)| existing == &word) {
-                ranked.push((score, word));
-                ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-                ranked.truncate(pool_size);
-            }
+            retain_ranked(&mut ranked, word, score, pool_size);
         }
         true
     });
     if cancelled.load(Ordering::Relaxed) {
         return Vec::new();
     }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     select_words(ranked, limit, &mut fastrand::Rng::new())
 }
 
@@ -301,6 +332,31 @@ mod tests {
                 &AtomicBool::new(false)
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_pool_keeps_the_best_scores_and_lexical_ties() {
+        let mut ranked = Vec::new();
+        retain_ranked(&mut ranked, "zulu".into(), 1., 2);
+        retain_ranked(&mut ranked, "bravo".into(), 1., 2);
+        retain_ranked(&mut ranked, "alpha".into(), 1., 2);
+        retain_ranked(&mut ranked, "best".into(), 2., 2);
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        assert_eq!(ranked, vec![(2., "best".into()), (1., "alpha".into())]);
+    }
+
+    #[test]
+    fn bounded_pool_ignores_duplicates_already_retained() {
+        let mut ranked = Vec::new();
+        retain_ranked(&mut ranked, "kept".into(), 1., 2);
+        retain_ranked(&mut ranked, "other".into(), 1., 2);
+        retain_ranked(&mut ranked, "kept".into(), 3., 2);
+        assert_eq!(ranked.len(), 2);
+        assert!(
+            ranked
+                .iter()
+                .any(|(score, word)| word == "kept" && *score == 1.)
         );
     }
 }

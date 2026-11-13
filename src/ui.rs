@@ -210,6 +210,9 @@ impl Dictionary {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
+                if this.update_in(cx, |_, _, _| ()).is_err() {
+                    break;
+                }
                 tick = tick.wrapping_add(1);
                 // The file watcher flags edits at once; the poll is the
                 // safety net, and the only way to notice a followed
@@ -222,7 +225,12 @@ impl Dictionary {
                     .background_executor()
                     .spawn(async move { sync(&store) })
                     .await;
-                let Some(next) = next else { continue };
+                let Some(next) = next else {
+                    if this.update_in(cx, |_, _, _| ()).is_err() {
+                        break;
+                    }
+                    continue;
+                };
                 let alive = this
                     .update_in(cx, |this, window, cx| {
                         if this.theme != next {
@@ -1013,9 +1021,8 @@ impl Dictionary {
                     } else {
                         div().child(daily.word.clone()).into_any_element()
                     };
-                    let entry = daily_entry(daily, source);
                     let credits = daily_credits(daily, urban_source);
-                    body = body.child(entry_content_with_title(p, &entry, live, &credits, Some(title)));
+                    body = body.child(daily_entry_content(p, daily, source, live, &credits, Some(title)));
                 }
                 body.into_any_element()
             }
@@ -1793,21 +1800,6 @@ fn badge_face(color: Hsla, text: &str) -> Div {
         .child(SharedString::from(text.to_owned()))
 }
 
-fn daily_entry(daily: &DailyWord, source: &'static str) -> Entry {
-    Entry {
-        word: daily.word.clone(),
-        phonetic: daily.phonetic.clone(),
-        source,
-        groups: vec![model::Group {
-            pos: daily.pos.clone().unwrap_or_else(|| "N/A".into()),
-            defs: vec![model::Def {
-                text: daily.text.clone(),
-                example: daily.example.clone(),
-            }],
-        }],
-    }
-}
-
 fn daily_credits(daily: &DailyWord, urban: bool) -> Vec<String> {
     let date = daily.date.as_deref().unwrap_or("");
     let credit = if urban {
@@ -1842,7 +1834,115 @@ fn entry_content_with_title(
     credits: &[String],
     title: Option<AnyElement>,
 ) -> AnyElement {
+    entry_content_from(p, entry, live, credits, title)
+}
+
+struct DailyEntry<'a> {
+    daily: &'a DailyWord,
+    source: &'static str,
+}
+
+trait EntryContentSource {
+    fn word(&self) -> &str;
+    fn phonetic(&self) -> &str;
+    fn source(&self) -> &'static str;
+    fn group_count(&self) -> usize;
+    fn group_pos(&self, group: usize) -> &str;
+    fn def_count(&self, group: usize) -> usize;
+    fn def_text(&self, group: usize, def: usize) -> &str;
+    fn def_example(&self, group: usize, def: usize) -> Option<&str>;
+}
+
+impl EntryContentSource for Entry {
+    fn word(&self) -> &str {
+        &self.word
+    }
+
+    fn phonetic(&self) -> &str {
+        &self.phonetic
+    }
+
+    fn source(&self) -> &'static str {
+        self.source
+    }
+
+    fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    fn group_pos(&self, group: usize) -> &str {
+        &self.groups[group].pos
+    }
+
+    fn def_count(&self, group: usize) -> usize {
+        self.groups[group].defs.len()
+    }
+
+    fn def_text(&self, group: usize, def: usize) -> &str {
+        &self.groups[group].defs[def].text
+    }
+
+    fn def_example(&self, group: usize, def: usize) -> Option<&str> {
+        self.groups[group].defs[def].example.as_deref()
+    }
+}
+
+impl EntryContentSource for DailyEntry<'_> {
+    fn word(&self) -> &str {
+        &self.daily.word
+    }
+
+    fn phonetic(&self) -> &str {
+        &self.daily.phonetic
+    }
+
+    fn source(&self) -> &'static str {
+        self.source
+    }
+
+    fn group_count(&self) -> usize {
+        1
+    }
+
+    fn group_pos(&self, _: usize) -> &str {
+        self.daily.pos.as_deref().unwrap_or("N/A")
+    }
+
+    fn def_count(&self, _: usize) -> usize {
+        1
+    }
+
+    fn def_text(&self, _: usize, _: usize) -> &str {
+        &self.daily.text
+    }
+
+    fn def_example(&self, _: usize, _: usize) -> Option<&str> {
+        self.daily.example.as_deref()
+    }
+}
+
+fn daily_entry_content(
+    p: &Palette,
+    daily: &DailyWord,
+    source: &'static str,
+    live: bool,
+    credits: &[String],
+    title: Option<AnyElement>,
+) -> AnyElement {
+    let data = DailyEntry { daily, source };
+    entry_content_from(p, &data, live, credits, title)
+}
+
+fn entry_content_from<T: EntryContentSource>(
+    p: &Palette,
+    entry: &T,
+    live: bool,
+    credits: &[String],
+    title: Option<AnyElement>,
+) -> AnyElement {
     let mut credit_index = 0;
+    let word = entry.word();
+    let source = entry.source();
     let heading = div()
         .flex()
         .flex_col()
@@ -1859,14 +1959,14 @@ fn entry_content_with_title(
                         .line_height(px(32.))
                         .font_weight(FontWeight::BOLD)
                         .child(title.unwrap_or_else(|| selectable(
-                            format!("{}-entry-title-{}", entry.source, entry.word),
-                            entry.word.clone(),
+                            format!("{source}-entry-title-{word}"),
+                            word.to_owned(),
                             live,
                         ))),
                 )
-                .child(badge(p, entry.source)),
+                .child(badge(p, source)),
         )
-        .when(valid_pronunciation(&entry.phonetic), |d| {
+        .when(valid_pronunciation(entry.phonetic()), |d| {
             d.child(
                 div()
                     .text_size(px(15.))
@@ -1874,16 +1974,17 @@ fn entry_content_with_title(
                     .italic()
                     .text_color(hsla(p.muted))
                     .child(PronunciationText {
-                        id: format!("{}-{}-entry-phonetic", entry.source, entry.word),
-                        text: entry.phonetic.clone(),
+                        id: format!("{source}-{word}-entry-phonetic"),
+                        text: entry.phonetic().to_owned(),
                         live,
                     }),
             )
         });
     let mut column = div().flex().flex_col().gap(px(18.)).child(heading);
-    for (group_index, group) in entry.groups.iter().enumerate() {
+    for group_index in 0..entry.group_count() {
+        let pos = entry.group_pos(group_index);
         let mut section = div().flex().flex_col().gap(px(10.));
-        if !group.pos.is_empty() {
+        if !pos.is_empty() {
             section = section.child(
                 div()
                     .flex()
@@ -1897,16 +1998,17 @@ fn entry_content_with_title(
                             .child(selectable(
                                 format!(
                                     "{}-{}-entry-pos-{group_index}-{}",
-                                    entry.source, entry.word, group.pos
+                                    source, word, pos
                                 ),
-                                group.pos.to_uppercase(),
+                                pos.to_uppercase(),
                                 live,
                             )),
                     )
                     .child(div().flex_1().h(px(1.)).bg(hsla(p.border))),
             );
         }
-        for (index, def) in group.defs.iter().enumerate() {
+        for index in 0..entry.def_count(group_index) {
+            let def = entry.def_text(group_index, index);
             section = section.child(
                 div()
                     .flex()
@@ -1919,8 +2021,8 @@ fn entry_content_with_title(
                             .flex()
                             .flex_col()
                             .gap(px(6.))
-                            .child(div().text_size(px(15.)).line_height(px(22.)).child(selectable(format!("{}-{}-entry-def-{group_index}-{index}-{}", entry.source, entry.word, def.text), def.text.clone(), live)))
-                            .when_some(def.example.clone(), |d, example| {
+                            .child(div().text_size(px(15.)).line_height(px(22.)).child(selectable(format!("{source}-{word}-entry-def-{group_index}-{index}-{def}"), def.to_owned(), live)))
+                            .when_some(entry.def_example(group_index, index), |d, example| {
                                 d.child(
                                     div()
                                         .pl(px(10.))
@@ -1929,14 +2031,14 @@ fn entry_content_with_title(
                                         .text_size(px(13.))
                                         .italic()
                                         .text_color(hsla(p.muted))
-                                        .child(selectable(format!("{}-{}-entry-example-{group_index}-{index}-{example}", entry.source, entry.word), example, live)),
+                                        .child(selectable(format!("{source}-{word}-entry-example-{group_index}-{index}-{example}"), example.to_owned(), live)),
                                 )
                             })
                             .when_some(credits.get(credit_index), |d, credit| {
                                 let mut color = hsla(p.muted);
                                 color.l = (color.l - 0.05).max(0.);
                                 d.child(div().text_size(px(11.)).text_color(color)
-                                    .child(selectable(format!("{}-{}-urban-credit-{credit_index}-{credit}", entry.source, entry.word), credit.clone(), live)))
+                                    .child(selectable(format!("{source}-{word}-urban-credit-{credit_index}-{credit}"), credit.clone(), live)))
                             }),
                     ),
             );
@@ -2016,6 +2118,27 @@ mod tests {
         assert!(daily_needs_refresh(false, None));
         assert!(!daily_needs_refresh(true, Some(Instant::now())));
         assert!(daily_needs_refresh(true, Some(Instant::now() - Duration::from_secs(3601))));
+    }
+
+    #[test]
+    fn daily_entry_render_source_borrows_long_definition_fields() {
+        let daily = DailyWord {
+            word: "fixture".into(),
+            phonetic: "/fɪkstʃɚ/".into(),
+            text: "A long featured definition".repeat(20),
+            pos: Some("noun".into()),
+            example: Some("A featured example".into()),
+            author: None,
+            date: None,
+        };
+        let source = DailyEntry {
+            daily: &daily,
+            source: "Wiktionary",
+        };
+        assert_eq!(source.def_text(0, 0), daily.text);
+        assert_eq!(source.def_text(0, 0).as_ptr(), daily.text.as_ptr());
+        assert_eq!(source.def_example(0, 0), daily.example.as_deref());
+        assert_eq!(source.group_pos(0), "noun");
     }
 
     #[test]
