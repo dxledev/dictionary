@@ -7,6 +7,18 @@ moment the file changes. It is a native Rust window with no web runtime.
 
 ## Features
 
+- **Words of the day.** The home page shows two distinct English featured words per source
+  from Wiktionary and Urban Dictionary, using the same word layout as query
+  results, with full part-of-speech labels, available pronunciation below the word,
+  just the first definition as a preview and independent loading
+  and retry controls.
+  Select a word to look it up. Source dates follow the published feed; a feed
+  may lag behind the current day. **Ctrl+U** also hides Urban on the home page.
+  **Ctrl+1** and **Ctrl+2** open the first Wiktionary and Urban selections. Returning
+  home refreshes selections cached for more than an hour.
+  Selections come from [Wiktionary's Word of the Day](https://en.wiktionary.org/wiki/Wiktionary:Word_of_the_day)
+  and Urban's `words_of_the_day` feed.
+- **Clear search.** The Clear button beside Search empties the field and returns home.
 - **Offline English.** 108,181 headwords from Webster's 1913, embedded in the
   binary and decompressed one letter at a time, so a lookup never holds a
   whole letter in memory.
@@ -15,11 +27,19 @@ moment the file changes. It is a native Rust window with no web runtime.
   word is missing from the offline text.
 - **Urban Dictionary.** English lookups also show up to five Urban Dictionary
   definitions in their own section, fetched in parallel so they never delay
-  the dictionary result. It also fills in slang that Webster's and Wiktionary
+  the dictionary result. Results share the dictionary layout, with author and
+  date beneath each Urban definition. Word types are inferred from grammatical
+  cues, with an optional NLTK fallback using the word in its example sentence;
+  ambiguous descriptions can still remain unknown. It also fills in
+  slang that Webster's and Wiktionary
   lack. Entries can be explicit; **Ctrl+U** hides the
   section. This uses Urban Dictionary's unofficial public JSON endpoint, whose
   terms say API access needs their permission, so check that before
   redistributing the app.
+- **Independent loading.** Each source shows its results as soon as they arrive,
+  with one shared loading panel while both are pending and a separate loading
+  panel for the remaining source once either finishes. Empty sources stay
+  hidden; if neither finds a definition, one final empty state appears.
 - **Heuristic non-English parsing.** English Wiktionary entries come from its
   structured definitions API. Other editions are read from page text, whose
   layout differs per edition, so senses are best-effort: French, German,
@@ -48,6 +68,62 @@ scripts/install.sh --dry-run    # preview
 `--follow PALETTE` (see below). It installs the desktop entry named
 "Dictionary" to `~/.local/share/applications` and `~/.local/bin/applications`,
 and appends one line to an existing apps list if you keep one.
+
+## Urban Dictionary word types
+
+Existing definition rules run first. For unresolved entries, an optional Python
+helper tags the actual headword in its example sentence in the background.
+It never tags definition prose to guess the headword's type. Explicitly mixed
+word types, conflicting uses, missing examples and multiword expressions can
+still show `N/A`. NLTK is trained on conventional English, so slang labels
+remain estimates.
+
+Definitions beginning with noun phrases such as “people who are…”, “someone
+who thinks…” or “a device that works…” are treated as nouns. Explicit word
+types and existing verb cues take precedence.
+
+Definitions with an inferred word type appear before `N/A` definitions. The
+original result order is preserved within each set.
+
+Install the optional environment and English model once (requires Python 3.10+
+and internet access):
+
+```sh
+bash scripts/setup-urban-pos.sh --dry-run
+bash scripts/setup-urban-pos.sh
+```
+
+The default environment is `$XDG_DATA_HOME/dictionary/nltk`, or
+`~/.local/share/dictionary/nltk`. Use `--prefix /absolute/path` to install
+elsewhere, then set `DICTIONARY_NLTK_PYTHON=/absolute/path/bin/python` and
+`NLTK_DATA=/absolute/path/nltk_data` when launching Dictionary. The helper is
+embedded in the Rust binary; the Python environment and model remain separate.
+There are no downloads during lookups. Each helper process has a three-second
+timeout. Missing dependencies or a helper failure leave the normal dictionary
+results available. Setup installs NumPy for NLTK's confidence-score calculation.
+
+Configuration:
+
+- `DICTIONARY_NLTK=0` disables the fallback.
+- `DICTIONARY_NLTK_PYTHON` selects a Python interpreter. Otherwise the managed
+  environment above is preferred, with `python3` as the final interpreter choice.
+- `NLTK_DATA` selects installed model data.
+- `DICTIONARY_NLTK_MIN_CONFIDENCE` sets the model-score cutoff (0–1, default 0.9).
+  This score is not a calibrated probability of slang correctness.
+
+The helper uses NLTK's English `averaged_perceptron_tagger_eng` JSON model and
+Treebank tokenization; no `punkt` download is needed. See the
+[NLTK tagger documentation](https://www.nltk.org/api/nltk.tag.PerceptronTagger.html).
+
+Run the existing isolated GPUI harness and fallback tests without opening a
+window on the desktop:
+
+```sh
+cargo test --offline
+python3 -m unittest discover -s scripts -p 'test_urban_pos.py'
+# Optional check after installing NLTK and its model:
+cargo test --offline installed_model_classifies_headword_in_context -- --ignored
+```
 
 ## Usage
 
@@ -119,7 +195,9 @@ date even if it was not running at the time. A manual `set`, `preset` or
 `import` stops following.
 
 Motion: panels fade and scale from 98% over 120 ms (ease-out-cubic). Set
-`DICTIONARY_REDUCED_MOTION=1` to make them instant.
+`DICTIONARY_REDUCED_MOTION=1` to make them instant. The search icon pulses while
+a source is loading, and loading panels show a rotating spinner. Reduced motion
+keeps both indicators static.
 
 ## Data and licenses
 

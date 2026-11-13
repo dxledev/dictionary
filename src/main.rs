@@ -2,9 +2,11 @@
 
 mod cli;
 mod color;
+mod daily;
 mod model;
 mod theme;
 mod urban;
+mod urban_pos;
 mod ui;
 
 use gpui_kit::{AppContext as _, WindowOptions, px, size};

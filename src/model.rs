@@ -253,7 +253,63 @@ fn wiktionary_rest(word: &str) -> Result<Option<Entry>, String> {
         // an outage, so let the extract endpoint decide.
         Err(_) => return Ok(None),
     };
-    Ok(parse_rest(word, &body))
+    let mut entry = parse_rest(word, &body);
+    if let Some(entry) = &mut entry {
+        entry.phonetic = pronunciation(word, "en").ok().flatten().unwrap_or_default();
+    }
+    Ok(entry)
+}
+
+/// Fetch IPA from the requested language's pronunciation section. This is
+/// separate from the definition endpoint because its response omits IPA.
+pub fn pronunciation(word: &str, lang: &str) -> Result<Option<String>, String> {
+    if word.trim().is_empty() {
+        return Ok(None);
+    }
+    let url = format!(
+        "https://{lang}.wiktionary.org/w/api.php?action=query&prop=extracts&explaintext=1&redirects=1&format=json&titles={}",
+        encode(word)
+    );
+    let body = curl(&url)?;
+    parse_pronunciation(&body, lang)
+}
+
+fn parse_pronunciation(body: &str, lang: &str) -> Result<Option<String>, String> {
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let pages = value.pointer("/query/pages").and_then(|p| p.as_object()).ok_or("unexpected response")?;
+    let Some(page) = pages.values().next() else { return Ok(None) };
+    let text = page.get("extract").and_then(|e| e.as_str()).unwrap_or_default();
+    let sections = parse_sections(text);
+    let language = language_section(&sections, lang);
+    let Some(language) = language else { return Ok(None) };
+    let mut phonetic = String::new();
+    find_language_ipa(language, &mut phonetic);
+    Ok((!phonetic.is_empty()).then_some(phonetic))
+}
+
+fn language_section<'a>(sections: &'a [Section], lang: &str) -> Option<&'a Section> {
+    let native = LANGS.iter().find(|l| l.0 == lang);
+    let autonym = AUTONYMS.iter().find(|a| a.0 == lang).map(|a| a.1.to_lowercase());
+    let matches = |title: &str| {
+        let title = title.to_lowercase();
+        native.is_some_and(|n| title.contains(&n.1.to_lowercase()) || title.contains(&n.2.to_lowercase()))
+            || autonym.as_ref().is_some_and(|a| title.contains(a.as_str()))
+    };
+    sections.iter().find(|s| s.level <= 2 && matches(&s.title))
+}
+
+fn find_language_ipa(section: &Section, phonetic: &mut String) {
+    for child in &section.children {
+        let title = child.title.to_lowercase();
+        if title.starts_with("pronunciation") || title.starts_with("prononciation") || title.starts_with("aussprache") {
+            if phonetic.is_empty() {
+                *phonetic = find_ipa(&child.body);
+            }
+        }
+        if phonetic.is_empty() {
+            find_language_ipa(child, phonetic);
+        }
+    }
 }
 
 pub fn parse_rest(word: &str, body: &str) -> Option<Entry> {
@@ -547,6 +603,15 @@ mod tests {
         assert_eq!(entry.groups[0].pos, "noun");
         assert_eq!(entry.groups[0].defs[0].text, "A fine & rare thing.");
         assert_eq!(entry.groups[0].defs[0].example.as_deref(), Some("An example."));
+    }
+
+    #[test]
+    fn pronunciation_uses_only_the_requested_language_section() {
+        let body = r#"{"query":{"pages":{"1":{"extract":"==French==\n===Pronunciation===\nIPA: /fʁɑ̃s/\n==English==\n===Pronunciation===\nIPA: /ɪŋɡlɪʃ/"}}}}"#;
+        assert_eq!(parse_pronunciation(body, "en").unwrap().as_deref(), Some("/ɪŋɡlɪʃ/"));
+        assert_eq!(parse_pronunciation(body, "fr").unwrap().as_deref(), Some("/fʁɑ̃s/"));
+        let no_english = r#"{"query":{"pages":{"1":{"extract":"==French==\n===Pronunciation===\nIPA: /fʁɑ̃s/"}}}}"#;
+        assert_eq!(parse_pronunciation(no_english, "en").unwrap(), None);
     }
 
     #[test]
