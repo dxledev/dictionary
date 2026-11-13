@@ -45,6 +45,21 @@ moment the file changes. It is a native Rust window with no web runtime.
   layout differs per edition, so senses are best-effort: French, German,
   Spanish, Italian, Turkish and Japanese read well; some editions (for
   example Russian and Polish) may show extra sections or nothing.
+- **Explore similar words.** English results end with up to 12 clickable word
+  badges, with no source labels or scores. Selecting a badge replaces the search
+  query and looks it up. Recommendations compare the current dictionary and
+  enabled Urban definitions with the embedded English dictionary, using
+  definition overlap and word references, with smaller bonuses for shared word
+  types, identical pronunciation and word prefixes. This is a lexical heuristic;
+  the bundled data has no dedicated etymology field. Recommendations run locally
+  in the background and cancel on query changes. Each search randomly samples
+  a broader pool of related words, favoring stronger matches while allowing
+  looser matches to appear too. Badges remain stable until the next search.
+  No extra network requests or saved query history are needed. The section is
+  hidden when no relevant matches exist and in non-English editions. Set
+  `DICTIONARY_SIMILAR_LIMIT=0` to disable it, or choose a limit from 1 to 24
+  (default 12). `DICTIONARY_SIMILAR_POOL` controls the candidate pool size
+  (default 96, at least the badge limit and at most 192).
 - **"Did you mean"** chips: up to three close words when nothing matches.
 - **Themeable from the CLI** with live reload, including translucent
   backgrounds.

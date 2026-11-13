@@ -183,6 +183,10 @@ pub fn webster(word: &str) -> Option<Entry> {
     let reader = GzDecoder::new(bucket_data(&bucket));
     let mut de = serde_json::Deserializer::from_reader(reader);
     let record = Pick(&key).deserialize(&mut de).ok()??;
+    record_entry(record)
+}
+
+fn record_entry(record: WebsterRecord) -> Option<Entry> {
     let groups: Vec<Group> = record
         .pos
         .into_iter()
@@ -202,6 +206,51 @@ pub fn webster(word: &str) -> Option<Entry> {
         source: "Webster's 1913",
         groups,
     })
+}
+
+pub(crate) fn scan_webster(mut visit: impl FnMut(Entry) -> bool) {
+    struct Scan<'a, F>(&'a mut F);
+    impl<'de, F: FnMut(Entry) -> bool> Visitor<'de> for Scan<'_, F> {
+        type Value = bool;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of headwords")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<bool, A::Error> {
+            while map.next_key::<IgnoredAny>()?.is_some() {
+                if let Some(entry) =
+                    record_entry(map.next_value::<WebsterRecord>()?)
+                {
+                    if !(self.0)(entry) {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    for bucket in ('a'..='z')
+        .map(|letter| letter.to_string())
+        .chain(["other".into()])
+    {
+        let mut decoder = serde_json::Deserializer::from_reader(
+            GzDecoder::new(bucket_data(&bucket)),
+        );
+        if !matches!(
+            serde::Deserializer::deserialize_map(
+                &mut decoder,
+                Scan(&mut visit)
+            ),
+            Ok(true)
+        ) {
+            break;
+        }
+    }
 }
 
 // -------------------------------------------------------------- Wiktionary

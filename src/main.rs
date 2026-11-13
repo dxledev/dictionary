@@ -4,6 +4,7 @@ mod cli;
 mod color;
 mod daily;
 mod model;
+mod similar;
 mod theme;
 mod urban;
 mod urban_pos;

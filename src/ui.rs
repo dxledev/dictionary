@@ -24,6 +24,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use crate::color::Rgba;
 use crate::daily::{self, DailyWord};
 use crate::model::{self, Entry, LANGS, Outcome};
+use crate::similar::{self, Profile};
 use crate::theme::{Palette, Store, Theme};
 use crate::urban::{self, UrbanDef};
 
@@ -160,6 +161,8 @@ pub struct Dictionary {
     /// Urban Dictionary results for the current word; `None` until asked.
     urban: Option<Result<Vec<UrbanDef>, String>>,
     urban_pending: bool,
+    similar_words: Vec<String>,
+    similar_cancel: Option<Arc<AtomicBool>>,
     /// Whether the Urban Dictionary section is shown (Ctrl U).
     urban_on: bool,
     daily_wiktionary: Option<Result<Vec<DailyWord>, String>>,
@@ -250,6 +253,8 @@ impl Dictionary {
             urban: None,
             urban_pending: false,
             urban_on: true,
+            similar_words: Vec::new(),
+            similar_cancel: None,
             daily_wiktionary: None,
             daily_urban: None,
             daily_wiktionary_pending: false,
@@ -291,6 +296,7 @@ impl Dictionary {
         let word = self.input.read(cx).value().trim().to_owned();
         if word.is_empty() {
             self.seq += 1;
+            self.reset_similar();
             self.view = View::Idle;
             self.urban = None;
             self.urban_pending = false;
@@ -376,6 +382,7 @@ impl Dictionary {
 
     fn search(&mut self, word: String, cx: &mut Context<Self>) {
         self.seq += 1;
+        self.reset_similar();
         let seq = self.seq;
         let lang = self.lang;
         self.view = View::Loading(word.clone());
@@ -394,6 +401,7 @@ impl Dictionary {
             let _ = this.update(cx, |this, cx| {
                 if this.seq == seq {
                     this.view = View::Done(word, outcome);
+                    this.request_similar(cx);
                     cx.notify();
                 }
             });
@@ -418,6 +426,61 @@ impl Dictionary {
                 if this.seq == seq {
                     this.urban = Some(found);
                     this.urban_pending = false;
+                    this.request_similar(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn reset_similar(&mut self) {
+        if let Some(cancelled) = self.similar_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.similar_words.clear();
+    }
+
+    fn request_similar(&mut self, cx: &mut Context<Self>) {
+        self.reset_similar();
+        let View::Done(word, outcome) = &self.view else {
+            return;
+        };
+        if self.lang != "en" || (self.urban_on && self.urban_pending) {
+            return;
+        }
+        let limit = similar::limit();
+        if limit == 0 {
+            return;
+        }
+        let entry = match outcome {
+            Outcome::Found(entry) => Some(entry),
+            _ => None,
+        };
+        let urban = if self.urban_on {
+            self.urban
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            &[]
+        };
+        let profile = Profile::new(word, entry, urban);
+        let seq = self.seq;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.similar_cancel = Some(cancelled.clone());
+        cx.spawn(async move |this, cx| {
+            let worker_cancel = cancelled.clone();
+            let words =
+                cx.background_executor()
+                    .spawn(async move {
+                        similar::find(&profile, limit, &worker_cancel)
+                    })
+                    .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.seq == seq && !cancelled.load(Ordering::Relaxed) {
+                    this.similar_words = words;
                     cx.notify();
                 }
             });
@@ -555,6 +618,7 @@ impl Dictionary {
             "escape" => {
                 if self.input.read(cx).value().is_empty() {
                     self.seq += 1;
+                    self.reset_similar();
                     self.view = View::Idle;
                     self.urban = None;
                     self.urban_pending = false;
@@ -585,6 +649,7 @@ impl Dictionary {
                 if self.urban_on && matches!(self.view, View::Idle) {
                     self.ensure_daily(cx);
                 }
+                self.request_similar(cx);
                 cx.notify();
             }
             "f1" => self.open(Kind::Help, window, cx),
@@ -1103,6 +1168,9 @@ impl Dictionary {
                     scroll,
                 )));
             }
+            if !self.similar_words.is_empty() {
+                column = column.child(self.similar_section(p, scroll, cx));
+            }
             return column.into_any_element();
         }
 
@@ -1121,6 +1189,54 @@ impl Dictionary {
         };
         debug_assert!(visibility.no_results);
         result_panel(p).child(fallback).into_any_element()
+    }
+
+    fn similar_section(
+        &self,
+        p: &Palette,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut badges = div().flex().flex_wrap().gap(px(8.));
+        for (index, word) in self.similar_words.iter().enumerate() {
+            let label = div()
+                .text_size(px(13.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(word.clone());
+            if live {
+                let word = word.clone();
+                badges = badges.child(
+                    pill(("similar-word", index), p, false)
+                        .h(px(32.))
+                        .px(px(12.))
+                        .max_w_full()
+                        .debug_selector(move || format!("similar-word-{index}"))
+                        .child(label)
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
+                                this.pick(&word, window, cx)
+                            },
+                        )),
+                );
+            } else {
+                badges =
+                    badges.child(div().px(px(12.)).py(px(6.)).child(label));
+            }
+        }
+        result_panel(p).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Explore similar words"),
+                )
+                .child(badges),
+        )
     }
 
     fn miss(
@@ -1925,6 +2041,67 @@ mod tests {
         );
         press(cx, "escape");
         assert!(view.read_with(cx, |d, _| matches!(d.view, View::Idle)));
+    }
+
+    #[gpui_kit::test]
+    fn similar_badge_replaces_query_and_searches(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        view.update(cx, |d, cx| {
+            d.urban_on = false;
+            d.view = View::Done(
+                "old".into(),
+                Outcome::Found(Entry {
+                    word: "old".into(),
+                    phonetic: String::new(),
+                    source: "fixture",
+                    groups: vec![model::Group {
+                        pos: "noun".into(),
+                        defs: vec![model::Def {
+                            text: "An old word.".into(),
+                            example: None,
+                        }],
+                    }],
+                }),
+            );
+            d.similar_words = vec!["xanthic".into()];
+            cx.notify();
+        });
+        draw(cx);
+        let bounds = cx
+            .debug_bounds("similar-word-0")
+            .expect("visible word badge");
+        cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
+        view.read_with(cx, |d, cx| {
+            assert_eq!(d.input.read(cx).value().as_str(), "xanthic");
+            assert!(matches!(&d.view, View::Loading(word) | View::Done(word, _) if word == "xanthic"));
+            assert!(!d.similar_words.iter().any(|word| word == "xanthic"));
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |d, _| matches!(&d.view, View::Done(word, Outcome::Found(_)) if word == "xanthic")));
+    }
+
+    #[gpui_kit::test]
+    fn clearing_search_cancels_similar_words(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |d, cx| {
+                d.urban_on = false;
+                d.view = View::Done(
+                    "happy".into(),
+                    Outcome::Found(model::webster("happy").unwrap()),
+                );
+                d.request_similar(cx);
+                let cancelled =
+                    d.similar_cancel.clone().expect("pending recommendations");
+                d.clear_search(window, cx);
+                assert!(cancelled.load(Ordering::Relaxed));
+                assert!(d.similar_words.is_empty());
+                assert!(d.similar_cancel.is_none());
+            })
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |d, _| d.similar_words.is_empty()
+            && matches!(d.view, View::Idle)));
     }
 
     #[gpui_kit::test]
