@@ -55,6 +55,7 @@ moment the file changes. It is a native Rust window with no web runtime.
   in the background and cancel on query changes. Each search randomly samples
   a broader pool of related words, favoring stronger matches while allowing
   looser matches to appear too. Badges remain stable until the next search.
+  Pointer hover lifts badges by 3px over 120ms; reduced motion keeps them still.
   No extra network requests or saved query history are needed. The section is
   hidden when no relevant matches exist and in non-English editions. Set
   `DICTIONARY_SIMILAR_LIMIT=0` to disable it, or choose a limit from 1 to 24

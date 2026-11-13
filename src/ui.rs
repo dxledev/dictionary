@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, App, AppContext as _, ClickEvent,
     Context, Div, ElementId, Entity, FocusHandle, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement, Render,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement, Render, RenderOnce,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window,
     WindowBackgroundAppearance, deferred, div, px,
 };
@@ -23,6 +23,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 
 use crate::color::Rgba;
 use crate::daily::{self, DailyWord};
+use crate::hover_lift::HoverLift;
 use crate::model::{self, Entry, LANGS, Outcome};
 use crate::similar::{self, Profile};
 use crate::theme::{Palette, Store, Theme};
@@ -784,30 +785,14 @@ impl Dictionary {
         match &self.view {
             View::Idle => String::new(),
             View::Loading(_) => "Looking up…".into(),
-            View::Done(_, Outcome::Found(entry)) => {
-                let mut kinds: Vec<&str> = Vec::new();
-                for group in &entry.groups {
-                    if !group.pos.is_empty()
-                        && !kinds.contains(&group.pos.as_str())
-                    {
-                        kinds.push(&group.pos);
-                    }
-                }
-                kinds.truncate(4);
-                kinds.join(" · ")
-            }
+            View::Done(_, Outcome::Found(_)) => String::new(),
             View::Done(
                 _,
                 Outcome::Missing { .. } | Outcome::Offline { .. },
             ) if self.urban_on && self.lang == "en" => {
                 match self.urban.as_ref() {
                     None => "Looking up…".into(),
-                    Some(Ok(defs)) if !defs.is_empty() => {
-                        defs[0].pos.map_or_else(
-                            || "Urban Dictionary".into(),
-                            |pos| pos.to_owned(),
-                        )
-                    }
+                    Some(Ok(defs)) if !defs.is_empty() => String::new(),
                     _ if matches!(
                         self.view,
                         View::Done(_, Outcome::Offline { .. })
@@ -1199,20 +1184,13 @@ impl Dictionary {
     ) -> Div {
         let mut badges = div().flex().flex_wrap().gap(px(8.));
         for (index, word) in self.similar_words.iter().enumerate() {
-            let label = div()
-                .text_size(px(13.))
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(word.clone());
             if live {
                 let word = word.clone();
                 badges = badges.child(
-                    pill(("similar-word", index), p, false)
-                        .h(px(32.))
-                        .px(px(12.))
-                        .max_w_full()
+                    similar_word_badge(p, &word, true)
+                        .id(("similar-word", index))
+                        .cursor_pointer()
                         .debug_selector(move || format!("similar-word-{index}"))
-                        .child(label)
                         .on_click(cx.listener(
                             move |this, _: &ClickEvent, window, cx| {
                                 this.pick(&word, window, cx)
@@ -1220,8 +1198,7 @@ impl Dictionary {
                         )),
                 );
             } else {
-                badges =
-                    badges.child(div().px(px(12.)).py(px(6.)).child(label));
+                badges = badges.child(similar_word_badge(p, word, false));
             }
         }
         result_panel(p).child(
@@ -1638,6 +1615,40 @@ fn selectable(id: String, text: String, live: bool) -> AnyElement {
     }
 }
 
+fn valid_pronunciation(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text.chars().any(char::is_alphabetic)
+        && !text.chars().any(|ch| {
+            ch.is_control()
+                || matches!(ch, '\u{fffd}' | '\u{fffc}' | '\u{25a1}' | '\u{25af}')
+        })
+}
+
+#[derive(IntoElement)]
+struct PronunciationText {
+    id: String,
+    text: String,
+    live: bool,
+}
+
+impl RenderOnce for PronunciationText {
+    fn render(self, window: &mut Window, _: &mut App) -> impl IntoElement {
+        let visible = valid_pronunciation(&self.text) && {
+            let style = window.text_style();
+            let line = window.text_system().shape_line(
+                self.text.clone().into(),
+                px(15.),
+                &[style.to_run(self.text.len())],
+                None,
+            );
+            // Shaping includes font fallback; glyph zero still means a missing glyph.
+            let mut glyphs = line.runs.iter().flat_map(|run| &run.glyphs).peekable();
+            glyphs.peek().is_some() && glyphs.all(|glyph| glyph.id.0 != 0)
+        };
+        div().when(visible, |d| d.child(selectable(self.id, self.text, self.live)))
+    }
+}
+
 /// The Urban Dictionary section under the entry. Still copies (`full` false)
 /// draw a single definition, since the blur paints the page dozens of times.
 fn urban_view(
@@ -1713,6 +1724,61 @@ fn badge(p: &Palette, text: &str) -> Div {
                 .left(px(0.)),
         )
         .child(badge_face(hsla(p.accent), text).relative())
+}
+
+fn similar_word_badge(p: &Palette, word: &str, live: bool) -> Div {
+    let shadow = gpui_kit::hsla(0., 0., 0., 0.35);
+    let background = p.surface.mix(Rgba::rgb(255, 255, 255), 0.06);
+    let hover = background.mix(Rgba::rgb(0, 0, 0), 0.12);
+    let face = similar_word_face(hsla(background), hsla(p.text), word).relative();
+    let face = if live {
+        face.id("similar-word-face")
+            .hover(move |style| style.bg(hsla(hover)))
+            .into_any_element()
+    } else {
+        face.into_any_element()
+    };
+    let badge = div()
+        .relative()
+        .max_w_full()
+        .rounded(px(12.))
+        .child(
+            similar_word_face(shadow, shadow, word)
+                .absolute()
+                .top(px(3.))
+                .left(px(0.)),
+        )
+        .child(face);
+    div().max_w_full().child(if live {
+        HoverLift::new(
+            badge,
+            px(3.),
+            gpui_kit::base::motion::Transition::new(MOTION).ease(ease_out_cubic),
+            reduced_motion(),
+        )
+        .into_any_element()
+    } else {
+        badge.into_any_element()
+    })
+}
+
+fn similar_word_face(background: Hsla, text: Hsla, word: &str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .h(px(32.))
+        .px(px(12.))
+        .max_w_full()
+        .rounded(px(12.))
+        .bg(background)
+        .text_size(px(13.))
+        .text_color(text)
+        .child(
+            div()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(word.to_owned()),
+        )
 }
 
 fn badge_face(color: Hsla, text: &str) -> Div {
@@ -1800,18 +1866,18 @@ fn entry_content_with_title(
                 )
                 .child(badge(p, entry.source)),
         )
-        .when(!entry.phonetic.is_empty(), |d| {
+        .when(valid_pronunciation(&entry.phonetic), |d| {
             d.child(
                 div()
                     .text_size(px(15.))
                     .line_height(px(18.))
                     .italic()
                     .text_color(hsla(p.muted))
-                    .child(selectable(
-                        format!("{}-{}-entry-phonetic", entry.source, entry.word),
-                        entry.phonetic.clone(),
+                    .child(PronunciationText {
+                        id: format!("{}-{}-entry-phonetic", entry.source, entry.word),
+                        text: entry.phonetic.clone(),
                         live,
-                    )),
+                    }),
             )
         });
     let mut column = div().flex().flex_col().gap(px(18.)).child(heading);
@@ -1916,6 +1982,16 @@ impl Render for Dictionary {
 mod tests {
     use super::*;
     use gpui_kit::{Point, TestAppContext, VisualTestContext};
+
+    #[test]
+    fn pronunciation_hides_corrupt_text_and_placeholder_symbols() {
+        for text in ["", "  ", "�", "/ə�/", "□", "a\u{fffc}", "a\0", "???"] {
+            assert!(!valid_pronunciation(text), "{text:?}");
+        }
+        for text in ["/əˈdʌltəri/", "ă-dŭl′tĕr-ē", "/fʁɑ̃s/", "ə"] {
+            assert!(valid_pronunciation(text), "{text:?}");
+        }
+    }
 
     #[test]
     fn alpha_survives_the_conversion() {
@@ -2041,6 +2117,51 @@ mod tests {
         );
         press(cx, "escape");
         assert!(view.read_with(cx, |d, _| matches!(d.view, View::Idle)));
+    }
+
+    #[gpui_kit::test]
+    fn similar_badge_repaints_on_hover_entry_and_exit(cx: &mut TestAppContext) {
+        struct BadgeFixture(std::rc::Rc<std::cell::Cell<usize>>);
+
+        impl Render for BadgeFixture {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut Context<Self>,
+            ) -> impl IntoElement {
+                self.0.set(self.0.get() + 1);
+                div().size_full().child(
+                    similar_word_badge(&Palette::default(), "related", true)
+                        .id("badge")
+                        .debug_selector(|| "hover-badge".into()),
+                )
+            }
+        }
+
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let renders = renders.clone();
+            move |_, _| BadgeFixture(renders)
+        });
+        draw(cx);
+        let bounds = cx.debug_bounds("hover-badge").unwrap();
+        let outside = Point {
+            x: bounds.right() + px(40.),
+            y: bounds.bottom() + px(40.),
+        };
+        cx.simulate_mouse_move(outside, None, gpui_kit::Modifiers::none());
+        let before = renders.get();
+        cx.simulate_mouse_move(bounds.center(), None, gpui_kit::Modifiers::none());
+        assert!(
+            renders.get() > before,
+            "hover entry must repaint immediately"
+        );
+        let entered = renders.get();
+        cx.simulate_mouse_move(outside, None, gpui_kit::Modifiers::none());
+        assert!(
+            renders.get() > entered,
+            "hover exit must repaint immediately"
+        );
     }
 
     #[gpui_kit::test]
@@ -2257,7 +2378,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn caption_tracks_urban_results_when_primary_is_missing(
+    fn caption_omits_parts_of_speech_and_keeps_lookup_status(
         cx: &mut TestAppContext,
     ) {
         let (view, cx, _dir) = open(cx);
@@ -2277,7 +2398,7 @@ mod tests {
                 author: String::new(),
                 date: String::new(),
             }]));
-            assert_eq!(d.caption(), "noun");
+            assert!(d.caption().is_empty());
             d.urban = Some(Ok(vec![UrbanDef {
                 word: "test".into(),
                 text: "Unmarked slang description.".into(),
@@ -2286,12 +2407,17 @@ mod tests {
                 author: String::new(),
                 date: String::new(),
             }]));
-            assert_eq!(d.caption(), "adjective");
+            assert!(d.caption().is_empty());
             d.urban_on = false;
             assert_eq!(d.caption(), "No definition");
             d.urban_on = true;
             d.urban = Some(Ok(vec![]));
             assert_eq!(d.caption(), "No definition");
+            d.view = View::Done(
+                "happy".into(),
+                Outcome::Found(model::webster("happy").unwrap()),
+            );
+            assert!(d.caption().is_empty());
         });
     }
 
