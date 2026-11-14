@@ -23,6 +23,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 
 use crate::color::Rgba;
 use crate::daily::{self, DailyWord};
+use crate::daily_cache::{self, Source};
 use crate::hover_lift::HoverLift;
 use crate::model::{self, Entry, LANGS, Outcome};
 use crate::similar::{self, Profile};
@@ -97,6 +98,15 @@ fn background_appearance(p: &Palette) -> WindowBackgroundAppearance {
 
 fn daily_needs_refresh(loaded: bool, fetched_at: Option<Instant>) -> bool {
     !loaded || fetched_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(60 * 60))
+}
+
+fn update_daily_result(
+    current: &mut Option<Result<Vec<DailyWord>, String>>,
+    result: Result<Vec<DailyWord>, String>,
+) {
+    if result.is_ok() || !current.as_ref().is_some_and(Result::is_ok) {
+        *current = Some(result);
+    }
 }
 
 enum View {
@@ -251,6 +261,8 @@ impl Dictionary {
             .as_deref()
             .and_then(|code| LANGS.iter().find(|l| l.0 == code))
             .map_or("en", |l| l.0);
+        let cached_wiktionary = (!cfg!(test)).then(|| daily_cache::load(Source::Wiktionary)).flatten();
+        let cached_urban = (!cfg!(test)).then(|| daily_cache::load(Source::Urban)).flatten();
         let mut this = Self {
             theme,
             input,
@@ -264,12 +276,12 @@ impl Dictionary {
             urban_on: true,
             similar_words: Vec::new(),
             similar_cancel: None,
-            daily_wiktionary: None,
-            daily_urban: None,
+            daily_wiktionary: cached_wiktionary.as_ref().map(|cache| Ok(cache.words.clone())),
+            daily_urban: cached_urban.as_ref().map(|cache| Ok(cache.words.clone())),
             daily_wiktionary_pending: false,
             daily_urban_pending: false,
-            daily_wiktionary_fetched: None,
-            daily_urban_fetched: None,
+            daily_wiktionary_fetched: cached_wiktionary.map(|cache| cache.fetched_at),
+            daily_urban_fetched: cached_urban.map(|cache| cache.fetched_at),
             focus: cx.focus_handle(),
             _watcher: watcher,
         };
@@ -279,10 +291,7 @@ impl Dictionary {
             });
             this.search(word, cx);
         } else if !cfg!(test) {
-            this.request_daily_wiktionary(cx);
-            if this.urban_on {
-                this.request_daily_urban(cx);
-            }
+            this.ensure_daily(cx);
         }
         match panel.as_deref() {
             Some("help") => this.open(Kind::Help, window, cx),
@@ -343,10 +352,16 @@ impl Dictionary {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { daily::wiktionary() })
+                .spawn(async {
+                    let result = daily::wiktionary();
+                    if let Ok(words) = &result {
+                        daily_cache::save(Source::Wiktionary, words);
+                    }
+                    result
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.daily_wiktionary = Some(result);
+                update_daily_result(&mut this.daily_wiktionary, result);
                 this.daily_wiktionary_fetched = Some(Instant::now());
                 this.daily_wiktionary_pending = false;
                 cx.notify();
@@ -364,10 +379,16 @@ impl Dictionary {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { daily::urban() })
+                .spawn(async {
+                    let result = daily::urban();
+                    if let Ok(words) = &result {
+                        daily_cache::save(Source::Urban, words);
+                    }
+                    result
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.daily_urban = Some(result);
+                update_daily_result(&mut this.daily_urban, result);
                 this.daily_urban_fetched = Some(Instant::now());
                 this.daily_urban_pending = false;
                 cx.notify();
@@ -2111,6 +2132,22 @@ mod tests {
         assert_eq!(ease_out_cubic(0.0), 0.0);
         assert_eq!(ease_out_cubic(1.0), 1.0);
         assert!(ease_out_cubic(0.5) > 0.5);
+    }
+
+    #[test]
+    fn failed_daily_refresh_keeps_cached_words() {
+        let words = vec![DailyWord {
+            word: "cached".into(), text: "Saved definition".into(),
+            pos: None, phonetic: String::new(), example: None, author: None, date: None,
+        }];
+        let mut current = Some(Ok(words.clone()));
+        update_daily_result(&mut current, Err("offline".into()));
+        assert_eq!(current, Some(Ok(words)));
+        update_daily_result(&mut current, Ok(Vec::new()));
+        assert_eq!(current, Some(Ok(Vec::new())));
+        let mut missing = None;
+        update_daily_result(&mut missing, Err("offline".into()));
+        assert_eq!(missing, Some(Err("offline".into())));
     }
 
     #[test]

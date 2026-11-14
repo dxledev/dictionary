@@ -3,7 +3,7 @@ use crate::model::{curl, strip_html};
 const WIKTIONARY_API: &str = "https://en.wiktionary.org/w/api.php?action=parse&page=Wiktionary%3AWord_of_the_day&prop=text&format=json";
 const URBAN_API: &str = "https://api.urbandictionary.com/v0/words_of_the_day";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DailyWord {
     pub word: String,
     pub text: String,

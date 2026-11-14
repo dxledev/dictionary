@@ -15,7 +15,10 @@ moment the file changes. It is a native Rust window with no web runtime.
   Select a word to look it up. Source dates follow the published feed; a feed
   may lag behind the current day. **Ctrl+U** also hides Urban on the home page.
   **Ctrl+1** and **Ctrl+2** open the first Wiktionary and Urban selections. Returning
-  home refreshes selections cached for more than an hour.
+  home refreshes selections cached for more than an hour. Selections persist in
+  `$XDG_CACHE_HOME/dictionary/daily` (default `~/.cache/dictionary/daily`) and
+  appear immediately on subsequent launches. Fresh caches skip network requests;
+  older selections remain visible during background refresh and on network failure.
   Selections come from [Wiktionary's Word of the Day](https://en.wiktionary.org/wiki/Wiktionary:Word_of_the_day)
   and Urban's `words_of_the_day` feed.
 - **Clear search.** The Clear button beside Search empties the field and returns home.

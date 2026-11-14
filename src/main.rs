@@ -3,6 +3,7 @@
 mod cli;
 mod color;
 mod daily;
+mod daily_cache;
 mod hover_lift;
 mod model;
 mod similar;
