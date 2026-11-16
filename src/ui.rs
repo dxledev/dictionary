@@ -30,15 +30,11 @@ use crate::similar::{self, Profile};
 use crate::theme::{Palette, Store, Theme};
 use crate::urban::{self, UrbanDef};
 
-/// Panels fade and scale from 98% over 120 ms with an ease-out-cubic curve,
-/// and closing runs the same motion backwards.
+/// Panels fade and move into place over 120 ms with an ease-out-cubic curve.
 const MOTION: Duration = Duration::from_millis(120);
 const SEARCH_PULSE: Duration = Duration::from_millis(900);
 const LOADING_SPIN: Duration = Duration::from_millis(1000);
-/// The blur samples the page on a grid of this many pixels, inside a disk of this radius.
-const BLUR_STEP: f32 = 2.2;
-const BLUR_RADIUS: f32 = 7.0;
-const SCRIM_ALPHA: f32 = 0.60;
+const SCRIM_ALPHA: f32 = 0.828;
 
 fn reduced_motion() -> bool {
     std::env::var("DICTIONARY_REDUCED_MOTION").is_ok_and(|v| v == "1")
@@ -126,6 +122,17 @@ struct Modal {
     closing: bool,
     /// Distinguishes one open or close from the next so each animates once.
     id: u64,
+    started: Option<Instant>,
+    start_progress: f32,
+    elapsed: Duration,
+}
+
+impl Modal {
+    fn progress(&self) -> f32 {
+        let t = (self.elapsed.as_secs_f32() / MOTION.as_secs_f32()).clamp(0.0, 1.0);
+        let target = if self.closing { 0.0 } else { 1.0 };
+        self.start_progress + (target - self.start_progress) * ease_out_cubic(t)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +175,7 @@ pub struct Dictionary {
     view: View,
     seq: u64,
     modal: Option<Modal>,
+    modal_sequence: u64,
     modal_row: usize,
     /// Urban Dictionary results for the current word; `None` until asked.
     urban: Option<Result<Vec<UrbanDef>, String>>,
@@ -270,6 +278,7 @@ impl Dictionary {
             view: View::Idle,
             seq: 0,
             modal: None,
+            modal_sequence: 0,
             modal_row: 0,
             urban: None,
             urban_pending: false,
@@ -546,17 +555,22 @@ impl Dictionary {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = self.modal.as_ref().map_or(0, |m| m.id) + 1;
+        self.modal_sequence = self.modal_sequence.wrapping_add(1);
+        let id = self.modal_sequence;
         self.modal_row =
             LANGS.iter().position(|l| l.0 == self.lang).unwrap_or(0);
         self.modal = Some(Modal {
             kind,
             closing: false,
             id,
+            started: None,
+            start_progress: 0.0,
+            elapsed: Duration::ZERO,
         });
         // Keys go to the window while a panel is up, not the text field.
         window.focus(&self.focus, cx);
         cx.notify();
+        self.start_modal_after_frame(id, window, cx);
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -566,27 +580,45 @@ impl Dictionary {
         if modal.closing {
             return;
         }
+        modal.start_progress = if reduced_motion() {
+            1.0
+        } else {
+            modal.progress()
+        };
+        modal.started = None;
+        modal.elapsed = Duration::ZERO;
         modal.closing = true;
-        modal.id += 1;
+        self.modal_sequence = self.modal_sequence.wrapping_add(1);
+        modal.id = self.modal_sequence;
         let id = modal.id;
         self.focus_input(window, cx);
         cx.notify();
-        let wait = if reduced_motion() {
-            Duration::ZERO
-        } else {
-            MOTION
-        };
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(wait).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.modal.as_ref().is_some_and(|m| m.id == id && m.closing)
-                {
+        self.start_modal_after_frame(id, window, cx);
+    }
+
+    fn start_modal_after_frame(&self, id: u64, window: &Window, cx: &mut Context<Self>) {
+        let owner = cx.weak_entity();
+        window.on_next_frame(move |window, cx| {
+            let _ = owner.update(cx, |this, cx| {
+                let Some(modal) = this.modal.as_mut().filter(|modal| modal.id == id) else { return; };
+                let now = Instant::now();
+                if reduced_motion() || cx.reduce_motion() {
+                    modal.elapsed = MOTION;
+                } else if let Some(started) = modal.started {
+                    let elapsed = if cfg!(test) { MOTION / 3 } else { now.saturating_duration_since(started).min(MOTION / 3) };
+                    modal.elapsed = (modal.elapsed + elapsed).min(MOTION);
+                }
+                modal.started = Some(now);
+                let done = modal.elapsed >= MOTION;
+                if done && modal.closing {
                     this.modal = None;
-                    cx.notify();
+                }
+                cx.notify();
+                if !done {
+                    this.start_modal_after_frame(id, window, cx);
                 }
             });
-        })
-        .detach();
+        });
     }
 
     fn choose_language(
@@ -1315,94 +1347,29 @@ impl Dictionary {
 
     fn modal_layer(
         &self,
-        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let modal = self.modal.as_ref()?;
         let p = self.palette();
-        let (kind, closing, id) = (modal.kind, modal.closing, modal.id);
-        let duration = if reduced_motion() {
-            Duration::from_millis(1)
+        let progress = if reduced_motion() || cx.reduce_motion() {
+            if modal.closing { 0.0 } else { 1.0 }
         } else {
-            MOTION
+            modal.progress()
         };
-
-        // A frozen, blurred copy of the page. Each copy is opaque and layer k
-        // has weight 1/(k+1), so the stack is a running mean of the samples
-        // (a disk of offsets on a grid about a stroke wide). The first copy
-        // is unshifted and covers the live page.
-        let bg = hsla(p.background.opaque());
-        let mut still = |dx: f32, dy: f32, weight: f32, n: usize| {
-            div()
-                .id(("still", n))
-                .absolute()
-                .top(px(dy))
-                .left(px(dx))
-                .size_full()
-                .bg(bg)
-                .opacity(weight)
-                .child(self.page(false, window, cx))
-        };
-        let mut offsets: Vec<(f32, f32)> = Vec::new();
-        for j in -3_i32..=3 {
-            for i in -3_i32..=3 {
-                let (x, y) = (i as f32 * BLUR_STEP, j as f32 * BLUR_STEP);
-                if (x, y) != (0.0, 0.0) && x.hypot(y) <= BLUR_RADIUS {
-                    offsets.push((x, y));
-                }
-            }
-        }
-        let mut blur = div()
-            .absolute()
-            .inset_0()
-            .overflow_hidden()
-            .child(still(0.0, 0.0, 1.0, 0));
-        for (k, (x, y)) in offsets.into_iter().enumerate() {
-            blur = blur.child(still(x, y, 1.0 / (k as f32 + 2.0), k + 1));
-        }
         let scrim = hsla(p.background.opaque()).opacity(SCRIM_ALPHA);
-        let card = self.card(kind, &p, cx);
-
-        let progress = move |t: f32| {
-            let eased = ease_out_cubic(t);
-            if closing { 1.0 - eased } else { eased }
-        };
+        let card = self.card(modal.kind, &p, cx)
+            .opacity(progress)
+            .w(px(480.0))
+            .relative()
+            .top(px((1.0 - progress) * 6.0));
         let layer = div()
-            .absolute()
-            .inset_0()
-            .occlude()
+            .absolute().inset_0().occlude()
             .on_mouse_down(
                 gpui_kit::MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.close(window, cx)),
             )
-            .child(blur.with_animation(
-                ElementId::from(("blur", id)),
-                Animation::new(duration),
-                move |el, t| el.opacity(progress(t)),
-            ))
-            .child(div().absolute().inset_0().bg(scrim).with_animation(
-                ElementId::from(("scrim", id)),
-                Animation::new(duration),
-                move |el, t| el.opacity(progress(t)),
-            ))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(card.with_animation(
-                        ElementId::from(("card", id)),
-                        Animation::new(duration),
-                        move |el, t| {
-                            let v = progress(t);
-                            el.opacity(v)
-                                .w(px(480.0 * (0.98 + 0.02 * v)))
-                                .mt(px((1.0 - v) * 6.0))
-                        },
-                    )),
-            );
+            .child(div().absolute().inset_0().bg(scrim).opacity(progress))
+            .child(div().absolute().inset_0().flex().items_center().justify_center().child(card));
         Some(deferred(layer).with_priority(10).into_any_element())
     }
 
@@ -1423,6 +1390,7 @@ impl Dictionary {
         };
         let mut card = div()
             .id("modal-card")
+            .debug_selector(|| "modal-card".into())
             .occlude()
             .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation()
@@ -2077,7 +2045,7 @@ impl Render for Dictionary {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let p = self.palette();
-        let modal = self.modal_layer(window, cx);
+        let modal = self.modal_layer(cx);
         div()
             .id("root")
             .size_full()
@@ -2105,6 +2073,43 @@ impl Render for Dictionary {
 mod tests {
     use super::*;
     use gpui_kit::{Point, TestAppContext, VisualTestContext};
+
+    #[gpui_kit::test]
+    fn reopening_a_panel_uses_a_fresh_animation_identity(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, _dir) = open(cx);
+        press(cx, "f1");
+        let first = view.read_with(cx, |d, _| d.modal.as_ref().unwrap().id);
+        press(cx, "escape");
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        press(cx, "f1");
+        let second = view.read_with(cx, |d, _| d.modal.as_ref().unwrap().id);
+        assert_ne!(first, second);
+    }
+
+    #[gpui_kit::test]
+    fn modal_frames_change_during_open_and_close(cx: &mut TestAppContext) {
+        let (view, cx, _dir) = open(cx);
+        cx.update(|window, cx| view.update(cx, |d, cx| d.open(Kind::Help, window, cx)));
+        draw(cx);
+        let first = cx.debug_bounds("modal-card").unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        draw(cx);
+        let next = cx.debug_bounds("modal-card").unwrap();
+        assert_eq!(next.size.width, first.size.width);
+        assert!(next.origin.y < first.origin.y);
+        cx.update(|window, cx| view.update(cx, |d, cx| d.close(window, cx)));
+        draw(cx);
+        let first = cx.debug_bounds("modal-card").unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        draw(cx);
+        let next = cx.debug_bounds("modal-card").unwrap();
+        assert_eq!(next.size.width, first.size.width);
+        assert!(next.origin.y > first.origin.y);
+    }
+
 
     #[test]
     fn pronunciation_hides_corrupt_text_and_placeholder_symbols() {
@@ -2233,6 +2238,7 @@ mod tests {
     fn draw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
+            window.simulate_next_frame(cx);
         });
     }
 
@@ -2420,8 +2426,7 @@ mod tests {
             Some((true, true)),
             "closing animates first"
         );
-        cx.executor().advance_clock(Duration::from_millis(200));
-        cx.run_until_parked();
+        for _ in 0..4 { draw(cx); }
         assert_eq!(modal_kind(&view, cx), None);
         assert_eq!(view.read_with(cx, |d, _| d.lang), "fr");
     }
@@ -2433,8 +2438,7 @@ mod tests {
         assert_eq!(modal_kind(&view, cx), Some((false, false)));
         press(cx, "escape");
         assert_eq!(modal_kind(&view, cx), Some((false, true)));
-        cx.executor().advance_clock(Duration::from_millis(200));
-        cx.run_until_parked();
+        for _ in 0..4 { draw(cx); }
         assert_eq!(modal_kind(&view, cx), None);
     }
 

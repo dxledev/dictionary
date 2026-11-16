@@ -213,7 +213,7 @@ link that dangles mid-switch is ignored and the last good colors stay. Running
 date even if it was not running at the time. A manual `set`, `preset` or
 `import` stops following.
 
-Motion: panels fade and scale from 98% over 120 ms (ease-out-cubic). Set
+Motion: panels fade and slide into place over 120 ms (ease-out-cubic). Set
 `DICTIONARY_REDUCED_MOTION=1` to make them instant. The search icon pulses while
 a source is loading, and loading panels show a rotating spinner. Reduced motion
 keeps both indicators static.
